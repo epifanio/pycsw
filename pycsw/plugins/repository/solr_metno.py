@@ -31,115 +31,122 @@
 #
 # =================================================================
 
-import base64
-from datetime import datetime
 import json
 import logging
+from datetime import datetime
 from urllib.parse import urlencode
+from operator import itemgetter
 
 import dateutil.parser as dparser
-from pycsw.core.etree import etree
-from pygeofilter.backends.solr.evaluate import to_filter
 import requests
+from pygeofilter import ast
+from pygeofilter.backends.solr.evaluate import SolrDSLQuery, to_filter
 from requests.auth import HTTPBasicAuth
+
+from pycsw.core.repository import Repository
 
 LOGGER = logging.getLogger(__name__)
 
 
-class SolrMETNORepository:
+class SolrMETNORepository(Repository):
     """
     Class to interact with underlying METNO Solr backend repository
     """
 
-    def __init__(self, repo_object: dict, context):
+    def __init__(self, repo_object, context):
         """
         Initialize repository
         """
-
+        LOGGER.debug("Initializing SorMETNORepoistory", repo_object)
         self.database = None
-        self.filter = repo_object.get('filter')
+        self.filter = repo_object.get("filter")
         #
-        self.xslt_iso_transformer = repo_object.get('xslt_iso_transformer')
-        self.xslt = repo_object.get('xslt')
-        #self.mmd_to_iso_xslt = self.xslt[self.xslt_iso_transformer]
+        self.xslt_iso_transformer = repo_object.get("xslt_iso_transformer")
+        self.xslt = repo_object.get("xslt")
+        # self.mmd_to_iso_xslt = self.xslt[self.xslt_iso_transformer]
         #
         self.context = context
         self.fts = False
-        self.label = 'MetNO/Solr'
+        self.label = "MetNO/Solr"
         self.local_ingest = True
-        self.solr_select_url = f'{self.filter}/select'
-        self.dbtype = 'Solr'
-        self.username = repo_object.get('username')
-        self.password = repo_object.get('password')
+        self.solr_select_url = f"{self.filter}/select"
+        self.dbtype = "Solr"
+        self.username = repo_object.get("username")
+        self.password = repo_object.get("password")
         self.authentication = HTTPBasicAuth(self.username, self.password)
         self.session = self
-        self.adc_collection = repo_object.get('adc_collection')
+        self.adc_collections = repo_object.get("adc_collections", None)
         # get the Solr mappings for main queryables
-        self.query_mappings = repo_object.get('solr_mappings')
+        self.query_mappings = repo_object.get("solr_mappings")
+        self.facets = repo_object.get("facets", [])
 
         # generate core queryables db and obj bindings
         self.queryables = {}
 
-        for tname in self.context.model['typenames']:
-            for qname in self.context.model['typenames'][tname]['queryables']:
+        for tname in self.context.model["typenames"]:
+            for qname in self.context.model["typenames"][tname]["queryables"]:
                 self.queryables[qname] = {}
-                items = self.context.model['typenames'][tname]['queryables'][
-                    qname
-                ].items()
+                items = self.context.model["typenames"][tname]["queryables"][qname].items()
 
                 for qkey, qvalue in items:
                     self.queryables[qname][qkey] = qvalue
 
         # flatten all queryables
-        self.queryables['_all'] = {}
+        self.queryables["_all"] = {}
         for qbl in self.queryables:
-            self.queryables['_all'].update(self.queryables[qbl])
-        self.queryables['_all'].update(self.context.md_core_model['mappings'])
+            self.queryables["_all"].update(self.queryables[qbl])
+        self.queryables["_all"].update(self.context.md_core_model["mappings"])
+        LOGGER.debug("Querables: %s", self.queryables)
 
     def describe(self) -> dict:
         """Derive table columns and types"""
 
         type_mappings = {
-            'TEXT': 'string',
-            'VARCHAR': 'string',
-            'text_en': 'string',
-            'text_general': 'string',
-            'pdate': 'string',
-            'bbox': 'string',
-            'string': 'string'
+            "TEXT": "string",
+            "VARCHAR": "string",
+            "text_en": "string",
+            "text_nb": "string",
+            "text_und": "string",
+            "text_general": "string",
+            "pdate": "string",
+            "date_range": "string",
+            "bbox": "string",
+            "geospatial_bounds3d": "string",
+            "string": "string",
         }
 
         try:
-            response = requests.get(f'{self.filter}/schema/fields',
-                                    auth=self.authentication)
+            response = requests.get(f"{self.filter}/schema/fields", auth=self.authentication)
             response.raise_for_status()
             response = response.json()
         except requests.exceptions.HTTPError as err:
-            msg = f'Solr query error: {err.response.text}'
+            msg = f"Solr query error: {err.response.text}"
             LOGGER.error(msg)
             raise RuntimeError(msg)
 
         properties = {
-            'geometry': {
-                '$ref': 'https://geojson.org/schema/Polygon.json',
-                'x-ogc-role': 'primary-geometry',
+            "geometry": {
+                "$ref": "https://geojson.org/schema/Polygon.json",
+                "x-ogc-role": "primary-geometry",
             }
         }
 
-        for field in response.get('fields', []):
-            if field['name'] in self.query_mappings.values():
-                pname = dict((v,k) for k,v in self.query_mappings.items()).get(field['name'])
-                properties[pname] = {
-                    'title': pname
-                }
-                if field['type'] in type_mappings:
-                    properties[pname]['type'] = type_mappings[field['type']]
-                    if field['type'] == 'pdate':
-                        properties[pname]['fomat'] = 'date-time'
+        for field in response.get("fields", []):
+            LOGGER.debug(f"Processing field: {field['name']} of type {field['type']}")
+            if field["name"] in self.query_mappings.values():
+                pname = dict((v, k) for k, v in self.query_mappings.items()).get(field["name"])
+                LOGGER.debug(f"Mapping Solr field '{field['name']}' to queryable '{pname}'")
+                properties[pname] = {"title": pname}
+                if field["type"] in type_mappings:
+                    properties[pname]["type"] = type_mappings[field["type"]]
+                    if field["type"] == "pdate":
+                        properties[pname]["format"] = "date-time"
+                    if field["type"] == "date_range":
+                        properties[pname]["format"] = "interval"
 
-                if pname == 'identifier':
-                    properties[pname]['x-ogc-role'] = 'id'
-
+                if pname == "identifier":
+                    properties[pname]["x-ogc-role"] = "id"
+        LOGGER.debug("Properties/describe: %s", properties)
         return properties
 
     def dataset(self, record):
@@ -147,7 +154,7 @@ class SolrMETNORepository:
         Stub to mock a pycsw dataset object for Transactions
         """
 
-        return type('dataset', (object,), record)
+        return type("dataset", (object,), record)
 
     def query_ids(self, ids: list) -> list:
         """
@@ -157,60 +164,31 @@ class SolrMETNORepository:
         results = []
 
         all_ids = '" OR "'.join(ids)
-        params = {
-            'fq': [
-                f'metadata_identifier:("{all_ids}")'
-            ],
-            'q.op': 'OR',
-            'q': '*:*'
-        }
+        query = SolrDSLQuery(filters=f'metadata_identifier:("{all_ids}")')
 
-        if self.adc_collection not in ['', None]:
-            params['fq'].append(f'collection:({self.adc_collection})')
+        if self.adc_collections not in ["", None]:
+            query.add_filter(f"collection:({self._collection_filter()})")
 
-        try:
-            response = requests.get(self.solr_select_url, params=params,
-                                    auth=self.authentication)
-            response.raise_for_status()
-            response = response.json()
-        except requests.exceptions.HTTPError as err:
-            msg = f'Solr query error: {err.response.text}'
-            LOGGER.error(msg)
-            raise RuntimeError(msg)
-
-        for doc in response['response']['docs']:
-            results.append(self._doc2record(doc))
+        _, results = self.do_query(query)
 
         return results
 
-    def query_collections(self, filters=None, limit=10) -> list:
-        ''' Query for parent collections '''
+    def query_collections(self, filters=None, limit=15) -> list:
+        """Query for parent collections"""
 
         results = []
 
-        params = {
-            'fq': ['isChild:false']
-        }
-        if self.adc_collection not in ['', None]:
-            params['fq'].append(f'collection:({self.adc_collection})')
-
-        try:
-            response = requests.get(self.solr_select_url, params=params,
-                                    auth=self.authentication)
-            response.raise_for_status()
-            response = response.json()
-        except requests.exceptions.HTTPError as err:
-            msg = f'Solr query error: {err.response.text}'
-            LOGGER.error(msg)
-            raise RuntimeError(msg)
-
-        for doc in response['response']['docs']:
-            results.append(self._doc2record(doc))
-
+        #query = SolrDSLQuery(filters="isChild:false")
+        query = SolrDSLQuery(filters="isParent:true")
+        query["limit"] = 15
+        if self.adc_collections not in ["", None]:
+            query.add_filter(f"collection:({self._collection_filter()})")
+        LOGGER.debug(f"Query collections with filters: {filters}")
+        total, results = self.do_query(query)
+        LOGGER.debug("Collection %s results: %s", total, results)
         return results
 
-    def query_domain(self, domain, typenames, domainquerytype='list',
-                     count=False) -> list:
+    def query_domain(self, domain, typenames, domainquerytype="list", count=False) -> list:
         """
         Query by property domain values
         """
@@ -218,76 +196,71 @@ class SolrMETNORepository:
         results = []
 
         params = {
-            'q': '*:*',
-            'rows': 0,
-            'facet': 'true',
-            'facet.query': 'distinct',
-            'facet.type': 'terms',
-            'facet.field': domain,
-            'fq': ['metadata_status:Active']
+            "q": "*:*",
+            "rows": 0,
+            "facet": "true",
+            "facet.query": "distinct",
+            "facet.type": "terms",
+            "facet.field": domain,
+            "fq": ["metadata_status:Active"],
         }
 
-        if self.adc_collection not in ['', None]:
-            params['fq'].append('collection:({self.adc_collection})')
+        if self.adc_collections not in ["", None]:
+            params["fq"].append("collection:({self._collection_filter()})")
 
         try:
-            response = requests.get(f'{self.filter}/select', params=params,
-                                    auth=self.authentication)
+            response = requests.get(f"{self.filter}/select", params=params, auth=self.authentication)
             response.raise_for_status()
             response = response.json()
         except requests.exceptions.HTTPError as err:
-            msg = f'Solr query error: {err.response.text}'
+            msg = f"Solr query error: {err.response.text}"
             LOGGER.error(msg)
             raise RuntimeError(msg)
 
-        counts = response['facet_counts']['facet_fields'][domain]
+        counts = response["facet_counts"]["facet_fields"][domain]
 
-        for term in zip(*([iter(counts)] * 2)):
-            LOGGER.debug(f'Term: {term}')
+        for term in zip(*([iter(counts)] * 2), strict=False):
+            LOGGER.debug(f"Term: {term}")
             results.append(term)
 
         return results
 
-    def query_insert(self, direction='max') -> str:
+    def query_insert(self, direction="max") -> str:
         """
         Query to get latest (default) or earliest update to repository
         """
 
-        if direction == 'min':
-            sort_order = 'asc'
+        if direction == "min":
+            sort_order = "asc"
         else:
-            sort_order = 'desc'
+            sort_order = "desc"
 
         params = {
-            'q': '*:*',
-            'q.op': 'OR',
-            'fl': 'timestamp',
-            'sort': f'timestamp {sort_order}',
-            'fq': ['metadata_status:Active'],
+            "q": "*:*",
+            "q.op": "OR",
+            "fl": "timestamp",
+            "sort": f"timestamp {sort_order}",
+            "fq": ["metadata_status:Active"],
         }
 
-        if self.adc_collection not in ['', None]:
-            params['fq'].append('collection:({self.adc_collection})')
+        if self.adc_collections not in ["", None]:
+            params["fq"].append("collection:({self._collection_filter})")
 
         try:
-            response = requests.get(f'{self.filter}/select', params=params,
-                                    auth=self.authentication)
+            response = requests.get(f"{self.filter}/select", params=params, auth=self.authentication)
             response.raise_for_status()
             response = response.json()
         except requests.exceptions.HTTPError as err:
-            msg = f'Solr query error: {err.response.text}'
+            msg = f"Solr query error: {err.response.text}"
             LOGGER.error(msg)
             raise RuntimeError(msg)
 
         try:
-            timestamp = datetime.strptime(
-                response['response']['docs'][0]['timestamp'],
-                '%Y-%m-%dT%H:%M:%S.%fZ'
-            )
+            timestamp = datetime.strptime(response["response"]["docs"][0]["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
         except IndexError:
             timestamp = datetime.now()
 
-        return timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
+        return timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def query_source(self, source):
         """
@@ -296,8 +269,7 @@ class SolrMETNORepository:
 
         return NotImplementedError()
 
-    def query(self, constraint=None, sortby=None, typenames=None, maxrecords=10,
-              startposition=0) -> tuple:
+    def query(self, constraint=None, sortby=None, typenames=None, maxrecords=10, startposition=0) -> tuple:
         """
         Query records from underlying repository
         """
@@ -305,273 +277,640 @@ class SolrMETNORepository:
         solr_query = {}
         results = []
 
-        if constraint.get('ast') is not None:
+        """Handle Constraints"""
+        constraint = constraint.get("ast")
+        if constraint is not None:
             # ask pygeofilter to convert AST to Solr query
-            solr_query = to_filter(constraint['ast'])
-            if 'csw:AnyText' in solr_query['query']:
-                solr_query['query'] = solr_query['query'].replace('csw:AnyText', 'full_text')
-            if 'ows:BoundingBox' in solr_query['query']:
-                solr_query['query'] = solr_query['query'].replace('ows:BoundingBox', 'bbox')
+            LOGGER.debug(ast.get_repr(constraint))
+
+            """rewrite Not GeometryDisjoint ast to GeometryIntersects.
+            """
+            constraint = handleNotGeometryDisjoint(constraint)
+
+            LOGGER.debug(f"AST Query: {ast.get_repr(constraint)}")
+            """ generate solr filter and do csw to solr fields query mappings"""
+            solr_query = to_filter(constraint, self.query_mappings)
+            #solr_query = self._remove_type_item(solr_query)
+            solr_query = self._update_type_item_to_true(solr_query)
+            LOGGER.debug(f"SOLR Queryi from to_filter: {solr_query}")
         else:
             # DO NOT ask pygeofilter to convert AST to Solr query
-            solr_query = {'query': '*:*'}
+            solr_query = SolrDSLQuery()
 
         # add handle sortby, maxrecords, startposition
-        solr_query['offset'] = startposition
-        solr_query['limit'] = maxrecords
+        solr_query["offset"] = startposition
+        solr_query["limit"] = maxrecords
 
+        # Special handle fix stac collection json api
+        if solr_query['query'] == 'typename:"stac:Collection"':
+            solr_query['query'] = 'isParent:true'
+
+        # Special handle type query
+        if solr_query['query'] == 'isChild:"dataset"':
+            solr_query['query'] = 'isParent:false'
+        elif solr_query['query'] == 'isChild:"series"':
+            solr_query['query'] = 'isParent:true'
+
+        LOGGER.debug(f"Sortby: {sortby}")
         if sortby is not None:
-            solr_query['sort'] = f"{sortby['propertyname']} {sortby['order']}"
+            solr_query["sort"] = f"{self.query_mappings[sortby['propertyname']]} {sortby['order']}"
+            LOGGER.debug(f"Sort: {solr_query['sort']}")
 
-        LOGGER.info(f'Solr query: {solr_query}')
-        try:
-            response = requests.post(f'{self.filter}/select', json=solr_query,
-                                     auth=self.authentication)
-            response.raise_for_status()
-            response = response.json()
-        except requests.exceptions.HTTPError as err:
-            msg = f'Solr query error: {err.response.text}'
-            LOGGER.error(msg)
-            raise RuntimeError(msg)
-
-        total = response['response']['numFound']
-        LOGGER.debug(f'Found: {total}')
-        for doc in response['response']['docs']:
-            results.append(self._doc2record(doc))
+        LOGGER.debug(f"Final Solr query: {solr_query}")
+        total, results = self.do_query(solr_query)
 
         return total, results
+   
+    def _remove_type_item(self,data):
+        """
+        Recursively remove the value 'type:"item"' from lists within a nested data structure.
+
+        :param data: The dictionary or list to traverse.
+        :return: The modified dictionary or list with 'type:"item"' removed.
+        """
+        if isinstance(data, dict):
+            # If data is a dictionary, recurse into its values
+            for key, value in data.items():
+                data[key] = self._replace_type_item(value)
+
+        elif isinstance(data, list):
+            # If data is a list, process each element recursively
+            data = [self._replace_type_item(item) if isinstance(item, (dict, list)) else "isChild:\"true\"" if item == "isChild:\"item\"" else item for item in data]
+
+        return data
+    
+				
+    def _update_type_item_to_true(self, data):
+        """
+        Recursively update the value of 'type' from 'item' to 'true' in a nested dictionary or list.
+
+        :param data: The dictionary or list to traverse.
+        :return: The modified dictionary or list with updated values.
+        """
+        if isinstance(data, dict):
+            # If data is a dictionary, recurse into its values
+            for key, value in data.items():
+                data[key] = self._update_type_item_to_true(value)
+
+        elif isinstance(data, list):
+            # If data is a list, process each element recursively
+            data = [self._update_type_item_to_true(item) if isinstance(item, (dict, list)) else "isChild:true" if item == "isChild:\"item\"" else item for item in data]
+
+        return data
+
+
+    def _collection_filter(self):
+        """
+        Get the collections to filter from config and generate solr collection filter string
+        """
+        collections_filter = ' '.join(self.adc_collections)
+        LOGGER.debug(f"MMD Collections filter: {collections_filter}")
+        return collections_filter
+
 
     def _doc2record(self, doc: dict):
         """
         Transform a Solr doc into a pycsw dataset object
         """
-
+        # LOGGER.debug("Transforming Solr doc to pycsw dataset object: %s", doc)
         record = {}
 
-        record['identifier'] = doc['metadata_identifier']
-        record['metadata_type'] = 'application/xml'
-        record['typename'] = 'gmd:MD_Metadata'
-        record['schema'] = 'http://www.isotc211.org/2005/gmd'
+        record["identifier"] = doc["metadata_identifier"]
+        record["metadata_type"] = "application/xml"
+        record["typename"] = "gmd:MD_Metadata"
+        record["schema"] = "http://www.isotc211.org/2005/gmd"
 
-        LOGGER.debug('Checking for parent-child relationship')
-#        if doc.get('isParent', False):
-#            record['type'] = 'series'
-#        else:
-#            record['type'] = 'dataset'
+        # LOGGER.debug("Checking for parent-child relationship")
+        #        if doc.get('isParent', False):
+        #            record['type'] = 'series'
+        #        else:
+        #            record['type'] = 'dataset'
 
-#        if doc.get('isChild', False):
-#            record['parentidentifier'] = doc['related_dataset'][0]
+        #        if doc.get('isChild', False):
+        #            record['parentidentifier'] = doc['related_dataset'][0]
 
-        if 'isParent' in doc and doc["isParent"]:
-            record['type'] = "series"
+        if "isParent" in doc and doc["isParent"]:
+            record["type"] = "series"
         else:
-            record['type'] = "dataset"
+            record["type"] = "dataset"
 
-        if 'isChild' in doc and doc["isChild"]:
-            record['parentidentifier'] = doc["related_dataset"][0]  
+        if "isChild" in doc and doc["isChild"]:
+            record["parentidentifier"] = doc["related_dataset"][0]
         else:
-            record['parentidentifier'] = None
+            record["parentidentifier"] = None
 
-        record['wkt_geometry'] = doc['bbox']
-        record['title'] = doc['title'][0]
-        record['abstract'] = doc['abstract'][0]
+        record["wkt_geometry"] = doc["bbox"]
+        record["title"] = doc["title"]
+        record["abstract"] = doc["abstract"]
 
-        if 'iso_topic_category' in doc:
-            record['topicategory'] = ','.join(doc['iso_topic_category'])
+        if "iso_topic_category" in doc:
+            record["topicategory"] = ",".join(doc["iso_topic_category"])
         else:
-            record['topicategory'] = None
+            record["topicategory"] = None
 
-#        if 'keywords_keyword' in doc:
-#            record['keywords'] = ','.join(doc['keywords_keyword'])
+        #        if 'keywords_keyword' in doc:
+        #            record['keywords'] = ','.join(doc['keywords_keyword'])
 
-#        if 'related_url_landing_page' in doc:
-#            record['source'] = doc['related_url_landing_page'][0]
+        #        if 'related_url_landing_page' in doc:
+        #            record['source'] = doc['related_url_landing_page'][0]
 
-        record['source'] = None
+        record["source"] = None
 
-        record['language'] = doc.get('dataset_language', 'en')
+        record["language"] = doc.get("dataset_language", "en")
 
         # Transform the indexed time as insert_data
-        insert = dparser.parse(doc['timestamp'][0])
-        record['insert_date'] = insert.isoformat()
+        insert = dparser.parse(doc["timestamp"][0])
+        record["insert_date"] = insert.isoformat()
+        record["date"] = insert.isoformat()
 
         # Transform the last metadata update datetime as modified
-        if 'last_metadata_update_datetime' in doc:
-            modified = dparser.parse(doc['last_metadata_update_datetime'][0])
-            record['date_modified'] = modified.isoformat()
+        record["date_creation"] = None
+        if "last_metadata_update_datetime" in doc:
+            last_metadata_updates = doc["last_metadata_update_datetime"]
+            last_metadata_updates_sorted = sorted(dparser.parse(x) for x in last_metadata_updates)
+            modified = last_metadata_updates_sorted[-1]
+            record["date_modified"] = modified.isoformat()
 
-            if 'Created' in doc['last_metadata_update_type']:
-                record['date_creation'] = modified.isoformat()
-            else:
-                record['date_creation'] = None
+            publication_date = last_metadata_updates_sorted[0]
+            record["date_publication"] =  publication_date.isoformat()
+
+            if "Created" in doc["last_metadata_update_type"]:
+                #record["date_creation"] = modified.isoformat()
+                created = last_metadata_updates_sorted[0]
+                record["date_creation"] = created
+
+        if "dataset_citation_publication_date" in doc:
+            publication_date = dparser.parse(doc["dataset_citation_publication_date"][0])
+            record["date_publication"] =  publication_date.isoformat()
+
 
         # Transform temporal extendt start and end dates
-        if 'temporal_extent_start_date' in doc:
-            #time_begin = dparser.parse(doc['temporal_extent_start_date'][0])
-            #record['time_begin'] = time_begin.isoformat()
-            record['time_begin'] = doc['temporal_extent_start_date'][0]
+        # LOGGER.debug("Checking for temporal extent start and end dates")
+        # record['time'] = {}
+        # record['time']['interval'] = {}
+        if "temporal_extent_start_date" in doc:
+            time_begin = dparser.parse(doc['temporal_extent_start_date'][0])
+            #record['time']['interval']['time_begin'] = time_begin.isoformat()
+            record["time_begin"] = time_begin.isoformat() # doc["temporal_extent_start_date"][0]
+            # record["time_begin"] = datetime.strptime(doc["temporal_extent_start_date"][0], "%Y-%m-%dT%H:%M:%SZ")
+            #LOGGER.debug(f"Temporal extent start date: {record['time']['time_begin']}")
 
-        if 'temporal_extent_end_date' in doc:
-            #time_end = dparser.parse(doc['temporal_extent_end_date'][0])
-            #record['time_end'] = time_end.isoformat()
-            #record['time_end'] = doc['temporal_extent_end_date'][0] 
-            record['time_end'] = None
+        if "temporal_extent_end_date" in doc:
+            time_end = dparser.parse(doc['temporal_extent_end_date'][0])
+            #record['time']['interval']['time_end'] = time_end.isoformat()
+            record['time_end'] = time_end.isoformat() #doc['temporal_extent_end_date'][0]
+            #record["time_end"] = datetime.strptime(doc["temporal_extent_end_date"][0], "%Y-%m-%dT%H:%M:%SZ")
         else:
-            record['time_end'] = None
+            record["time_end"] = None
 
         links = []
-        record['relation'] = None
+        # LOGGER.debug(f"Processing record properties: {list(record.keys())}")
+        record["relation"] = None
 
-        if 'data_access_url_opendap' in doc:
+        # name, description, protocol, url
+        if "data_access_url_opendap" in doc:
             links.append(
                 {
-                    'name': 'OPeNDAP access',
-                    'description': 'OPeNDAP access',
-                    'protocol': 'OPeNDAP:OPeNDAP',
-                    'url': doc['data_access_url_opendap'][0],
+                    "name": "OPeNDAP access",
+                    "description": "OPeNDAP access",
+                    "protocol": "OPeNDAP:OPeNDAP",
+                    #"type": "OPeNDAP:OPeNDAP",
+                    #"rel": "enclosure",
+                    "url": doc["data_access_url_opendap"][0],
                 }
             )
-        if 'data_access_url_ogc_wms' in doc:
+        if "data_access_url_ogc_wms" in doc:
             links.append(
                 {
-                    'name': 'OGC-WMS Web Map Service',
-                    'description': 'OGC-WMS Web Map Service',
-                    'protocol': 'OGC:WMS',
-                    'url': doc['data_access_url_ogc_wms'][0],
+                    "name": "OGC-WMS Web Map Service",
+                    "description": "OGC-WMS Web Map Service",
+                    "protocol": "OGC:WMS",
+                    #"type": "OGC:WMS",
+                    #"rel": "describes",
+                    "url": doc["data_access_url_ogc_wms"][0],
                 }
             )
-        if 'data_access_url_http' in doc:
+        if "data_access_url_http" in doc:
             links.append(
                 {
-                    'name': 'File for download',
-                    'description': 'Direct HTTP download',
-                    'protocol': 'WWW:DOWNLOAD-1.0-http--download',
-                    'url': doc['data_access_url_http'][0],
+                    "name": "File for download",
+                    "description": "Direct HTTP download",
+                    "protocol": "WWW:DOWNLOAD-1.0-http--download",
+                    #"type": "WWW:DOWNLOAD-1.0-http--download",
+                    #"rel": "enclosure",
+                    "url": doc["data_access_url_http"][0],
                 }
             )
-        if 'data_access_url_ftp' in doc:
+        if "data_access_url_ftp" in doc:
             links.append(
                 {
-                    'name': 'File for download',
-                    'description': 'Direct FTP download',
-                    'protocol': 'ftp',
-                    'url': doc['data_access_url_ftp'][0],
+                    "name": "File for download",
+                    "description": "Direct FTP download",
+                    "protocol": "ftp",
+                    #"type": "ftp",
+                    #"rel": "enclosure",
+                    "url": doc["data_access_url_ftp"][0],
                 }
             )
-        record['links'] = json.dumps(links)
+        if "related_url_landing_page" in doc:
+            links.append(
+                {
+                    "name": "Dataset landing page",
+                    "description": "URL of the dataset landing page",
+                    "rel": "about",
+                    "url": doc["related_url_landing_page"][0],
+                }
+            )
+        if "use_constraint_resource" in doc and doc['use_constraint_resource'] != 'Not provided':
+            links.append(
+                {
+                    "name": "License",
+                    "description": "URL of the license",
+                    "rel": "license",
+                    "url": doc["use_constraint_resource"],
+                }
+            )
+        record["links"] = json.dumps(links)
 
         # Transform the first investigator as creator.
-        if 'personnel_investigator_name' in doc:
-            record['creator'] = ','.join(doc['personnel_investigator_name'])
+        if "personnel_investigator_name" in doc:
+            record["creator"] = ",".join(doc["personnel_investigator_name"])
 
-        if 'personnel_technical_name' in doc:
-            record['contributor'] = ','.join(doc['personnel_technical_name'])
+        if "personnel_technical_name" in doc:
+            record["contributor"] = ",".join(doc["personnel_technical_name"])
 
-        if 'personnel_metadata_author_name' in doc:
-            if 'contributor' in record:
-                record['contributor'] += ',' + ','.join(
-                    doc['personnel_metadata_author_name']
-                )
+        if "personnel_metadata_author_name" in doc:
+            if "contributor" in record:
+                record["contributor"] += "," + ",".join(doc["personnel_metadata_author_name"])
             else:
-                record['contributor'] = ','.join(doc['personnel_metadata_author_name'])  # noqa
+                record["contributor"] = ",".join(doc["personnel_metadata_author_name"])  # noqa
 
         contacts = []
-        for ct in ['technical', 'investigator', 'metadata_author']:
-            ct2 = personnel2contact(doc, ct)
-            if ct2:
-                contacts.append(personnel2contact(doc, ct))
+        for ct in ["technical", "investigator", "metadata_author", "datacenter"]:
+            if f"personnel_{ct}_name" in doc:
+                for i,v in enumerate(doc[f"personnel_{ct}_name"]):
+                    ct2 = personnel2contact(doc, ct, index = i)
+                    if ct2:
+                        contacts.append(ct2)
 
-        record['contacts'] = json.dumps(contacts)
-        #record['themes'] = keywords2themes(doc)
-        record['themes'], record['keywords'] = keywords2themes(doc)
+        record["contacts"] = json.dumps(contacts)
+        record["providers"] = json.dumps(contacts)
+        #LOGGER.debug(f"Record contacts is of type: {type(contacts)}")
+        #LOGGER.debug(f"Parsed contacts for record {record['identifier']}: {contacts}")
+        #LOGGER.debug("Jsonified contacts: %s", str(json.dumps(contacts)))
+        #record["contacts"] = json.dumps([contacts])# if contacts else None
+        # record["contacts"] = json.dumps([{'role': 'creator', 'name': 'satan'}])
+        # record['themes'] = keywords2themes(doc)
+        record["themes"], record["keywords"] = keywords2themes(doc)
+
+#        if "platform_short_name" in doc:
+#            record["platform"] = doc.get("platform_short_name")[0]
+#
+#        if "instrument_short_name" in doc:
+#            record["instrument"] = doc.get("platform_short_name")[0]
 
         # TODO: rights is mapped to accessconstraint, although we provide this
         # info in the use constraint.
         # we should use dc:license instead, but it is not mapped in csw.
-        if 'use_constraint_license_text' in doc:
-            record['otherconstraints'] = doc.get('use_constraint_license_text')
+        if "use_constraint_license_text" in doc:
+            record["otherconstraints"] = doc.get("use_constraint_license_text")
         else:
-            record['otherconstraints'] = doc.get('use_constraint_identifier')
+            record["otherconstraints"] = doc.get("use_constraint_identifier")
 
-        #this is mapped to rights. We do not have it
-        record['conditionapplyingtoaccessanduse'] = None
+        # this is mapped to rights. We do not have it
+        record["conditionapplyingtoaccessanduse"] = None
 
-        if 'dataset_citation_publisher' in doc:
-            record['publisher'] = doc['dataset_citation_publisher'][0]
+#        if "dataset_citation_publisher" in doc:
+#            record["publisher"] = doc["dataset_citation_publisher"][0]
 
-        if 'storage_information_file_format' in doc:
-            record['format'] = doc['storage_information_file_format']
+        if "storage_information_file_format" in doc:
+            record["format"] = doc["storage_information_file_format"]
         else:
-            record['format'] = 'Not provided'
+            record["format"] = "Not provided"
 
-#        transform = etree.XSLT(etree.parse(self.mmd_to_iso_xslt))
-#        xml_ = base64.b64decode(doc['mmd_xml_file'])
-#
-#        doc_ = etree.fromstring(xml_, self.context.parser)
-#        pl = '/usr/local/share/parent_list.xml'
-#        result_tree = transform(
-#            doc_, path_to_parent_list=etree.XSLT.strparam(pl)).getroot()
-#        record['xml'] = etree.tostring(result_tree)
-#        record['mmd_xml_file'] = doc['mmd_xml_file']
-#
-#        LOGGER.debug(record['xml'])
-        params = {
-            'q.op': 'OR',
-            'q': f"metadata_identifier:{doc['metadata_identifier']}"
-        }
+        #        transform = etree.XSLT(etree.parse(self.mmd_to_iso_xslt))
+        #        xml_ = base64.b64decode(doc['mmd_xml_file'])
+        #
+        #        doc_ = etree.fromstring(xml_, self.context.parser)
+        #        pl = '/usr/local/share/parent_list.xml'
+        #        result_tree = transform(
+        #            doc_, path_to_parent_list=etree.XSLT.strparam(pl)).getroot()
+        #        record['xml'] = etree.tostring(result_tree)
+        #        record['mmd_xml_file'] = doc['mmd_xml_file']
+        #
+        #        LOGGER.debug(record['xml'])
+        params = {"q.op": "OR", "q": f"metadata_identifier:{doc['metadata_identifier']}"}
 
         mdsource_url = self.solr_select_url + urlencode(params)
-        record['mdsource'] = mdsource_url
+        record["mdsource"] = mdsource_url
+        # LOGGER.debug(f"RECORD PROPERTIES: {list(record.keys())}")
+        # LOGGER.debug(f"RECORD PROPERTIES: {dir(record)}")
 
         return self.dataset(record)
+     
+
+    def get_facets(self, ast=None) -> dict:
+        """
+        Gets all facets for a given query
+
+        :returns: `dict` of facets
+        """
+
+        facets_results = {}
+        
+        # Generate solr facet queries
+        facets_query = SolrDSLQuery()
+        facets_query['facet'] = {}
+        for facet in self.facets:
+            LOGGER.debug(f'Running facet for {facet}')
+            facets_query['facet'][facet] = {
+                        "type": "terms",
+                        "field": facet,
+                        "limit": 20
+            }
+            facets_results[facet] = {
+                'type': 'terms',
+                'property': facet,
+                'buckets': []
+            }
+        LOGGER.debug(f"FINAL facetq is: {facets_query}")
+        
+        # Send facet query to Solr
+        resp = self.do_query(facets_query, return_results=False)
+        LOGGER.debug(f"SOLR FACETS RESULTS: {resp['facets']}")
+
+        # Process facets solr results and generate pycsw facets_results dict
+        for facet in self.facets:
+            bucket = resp['facets'][facet]['buckets']
+            for fq in bucket:
+                facets_results[facet]['buckets'].append({
+                    'value': fq['val'],
+                    'count': fq['count']
+                })
+        facets_results[facet]['buckets'].sort(key=itemgetter('count'), reverse=True)
+        LOGGER.debug(f"PYCSW facet results: {facets_results}")
+        return facets_results
 
     def ping(self):
-        pass
+        """
+        Ping the Solr service
+        """
+        try:
+            response = requests.get(f"{self.filter}/admin/ping", auth=self.authentication)
+            response.raise_for_status()
+            response = response.json()
+        except requests.exceptions.HTTPError as err:
+            msg = f"Solr query error: {err.response.text}"
+            LOGGER.error(msg)
+            raise RuntimeError(msg)
+        status = response["status"]
+        LOGGER.debug(f"Solr Ping: {status}")
+
+    def do_query(self, solr_query, return_results=True):
+        results = []
+        
+        # Make sure we have default filtes
+        filters = solr_query.get('filter', None)
+        if filters is not None:
+            contains_collection = any("collection:" in item for item in filters)
+            if not contains_collection:
+                solr_query['filter'].append("collection:({self._collection_filter})")
+            
+            contains_metadata_status = any("metadata_status:" in item for item in filters)
+            if not contains_metadata_status:
+                solr_query['filter'].append("metadata_status:Active")
+        else:
+            solr_query.add_filter(f"collection:({self._collection_filter()})")
+            solr_query.add_filter(f"metadata_status:Active")
+
+        LOGGER.debug(f"Solr filter queries: {filters}")
+        LOGGER.debug(f"Do Solr query with query: {solr_query}")
+        try:
+            response = requests.post(f"{self.filter}/select", json=solr_query, auth=self.authentication)
+            response.raise_for_status()
+            response = response.json()
+        except requests.exceptions.HTTPError as err:
+            msg = f"Solr query error: {err.response.text}"
+            LOGGER.error(msg)
+            raise RuntimeError(msg)
+
+        total = response["response"]["numFound"]
+        LOGGER.debug(f"Found: {total}")
+        if return_results:
+            for doc in response["response"]["docs"]:
+                results.append(self._doc2record(doc))
+
+            return total, results
+        else:
+            return response
 
 
 def keywords2themes(doc: dict) -> list:
     schemes = {}
     themes = []
-    kvoctothesaurus = {'GCMDSK' : 'https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/sciencekeywords',
-          'CFSTDN' : 'https://vocab.nerc.ac.uk/standard_name/',
-          'GEMET' : 'http://inspire.ec.europa.eu/theme',
-          'NORTHEMES' : 'https://register.geonorge.no/metadata-kodelister/nasjonal-temainndeling',
-          'GCMDPROV': 'https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/providers',
-          'GCMDLOC' : 'https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/locations'}
+    kvoctothesaurus = {
+        "GCMDSK": "https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/sciencekeywords",
+        "CFSTDN": "https://vocab.nerc.ac.uk/standard_name/",
+        "GEMET": "http://inspire.ec.europa.eu/theme",
+        "NORTHEMES": "https://register.geonorge.no/metadata-kodelister/nasjonal-temainndeling",
+        "GCMDPROV": "https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/providers",
+        "GCMDLOC": "https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/locations",
+        "GCMDPLT": "https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/platforms",
+        "GCMDINST": "https://gcmd.earthdata.nasa.gov/kms/concepts/concept_scheme/instruments",
+    }
     keywords = ""
 
-    for scheme in set(doc.get('keywords_vocabulary', [])):
+    for scheme in set(doc.get("keywords_vocabulary", [])):
         schemes[scheme] = []
-        for index, value in enumerate(doc['keywords_keyword']):
-            if doc['keywords_vocabulary'][index] == scheme:
-                schemes[doc['keywords_vocabulary'][index]].append(value)
+        for index, value in enumerate(doc["keywords_keyword"]):
+            if doc["keywords_vocabulary"][index] == scheme:
+                schemes[doc["keywords_vocabulary"][index]].append(value)
+
 
     for key, value in schemes.items():
         if key != "None":
-            themes.append({
-                'keywords': [{'name': v} for v in value],
-                #'scheme': key,
-                'thesaurus': {'title': key, 'url' : kvoctothesaurus[key]}
-            })
+            themes.append(
+                {
+                    "keywords": [{"name": v} for v in value],
+                    #'scheme': key,
+                    "thesaurus": {"title": key, "url": kvoctothesaurus[key]},
+                }
+            )
         else:
             keywords = ",".join(value)
+
+    pltthesaurus = {
+        "oscar": "https://space.oscar.wmo.int/satellites",
+        "vocab.nerc.ac.uk/collection/C17": "https://vocab.nerc.ac.uk/collection/C17/current/",
+        }
+
+    if "platform_long_name" in doc:
+        freeplt = []
+        schemes_plt = {}
+        for k in pltthesaurus:
+            schemes_plt[k] = []
+            for index, value in enumerate(doc["platform_long_name"]):
+                if 'platform_resource' in doc:
+                    if k in doc["platform_resource"][index]:
+                        schemes_plt[k].append(value)
+                    else:
+                        if value not in freeplt:
+                            freeplt.append(value)
+
+
+        for key,value in schemes_plt.items():
+            if value:
+                themes.append(
+                       {
+                           "keywords": [{"name": v} for v in value],
+                           "thesaurus": {"url": pltthesaurus[key]},
+                       }
+                   )
+        if keywords != "":
+            keywords += ','+','.join(freeplt)
+        else:
+            keywords = ','.join(freeplt)
+
+    instthesaurus = {
+        "oscar": "https://space.oscar.wmo.int/instruments",
+        "vocab.nerc.ac.uk/collection/L22": "http://vocab.nerc.ac.uk/collection/L22/current/",
+        "vocab.nerc.ac.uk/collection/L05": "http://vocab.nerc.ac.uk/collection/L05/current/",
+        }
+
+    if "platform_instrument_long_name" in doc:
+        freeinst = []
+        schemes_inst = {}
+        for k in instthesaurus:
+            schemes_inst[k] = []
+            for index, value in enumerate(doc["platform_instrument_long_name"]):
+                if 'platform_instrument_resource' in doc:
+                    if k in doc["platform_instrument_resource"][index]:
+                        schemes_inst[k].append(value)
+                    else:
+                        if value not in freeinst:
+                            freeinst.append(value)
+
+
+        for key,value in schemes_inst.items():
+            if value:
+                themes.append(
+                       {
+                           "keywords": [{"name": v} for v in value],
+                           "thesaurus": {"url": instthesaurus[key]},
+                       }
+                   )
+        if keywords != "":
+            keywords += ','+','.join(freeinst)
+        else:
+            keywords = ','.join(freeinst)
 
     return json.dumps(themes), keywords
 
 
-def personnel2contact(doc: dict, ct: str) -> dict:
+def personnel2contact(doc: dict, ct: str, index: int = 0) -> dict:
     contact = {}
 
-    mmdrole2roles = {'metadata_author': 'Metadata author',
-                     'technical' : 'Technical contact',
-                     'investigator': 'Investigator'}
+    mmdrole2roles = {
+        "metadata_author": "contributor",
+        "technical": "contributor",
+        "investigator": "creator",
+        "datacenter": "publisher",
+    }
 
-    if f'personnel_{ct}_name' in doc:
+    if f"personnel_{ct}_name" in doc:
         contact = {
-            'name': doc[f'personnel_{ct}_name'][0],
-            'organization': doc[f'personnel_{ct}_organisation'][0],
-            'role': mmdrole2roles[f'{ct}'],
-            'email': doc[f'personnel_{ct}_email'][0],
+            "name": doc[f"personnel_{ct}_name"][index],
+            "organization": doc[f"personnel_{ct}_organisation"][index],
+            "role": mmdrole2roles[f"{ct}"],
+            "email": doc[f"personnel_{ct}_email"][index],
         }
 
     return contact
+
+
+def handleNotGeometryDisjoint(node: ast.Node, parent: ast.Node = None, parent_attr: str = None):
+    """
+    Traverse the AST and replace Not(GeometryDisjoint) with GeometryIntersects.
+
+    :param node: The current AST node being processed.
+    :param parent: The parent node of the current node (used for replacement).
+    :param parent_attr: The attribute name in the parent node that references the current node.
+    :return: The updated AST node.
+    """
+    # LOGGER.debug(f"Processing node of type: {type(node)}")
+
+    # Check if the current node is an ast.Not
+    if isinstance(node, ast.Not):
+        # LOGGER.debug(f"Original Node: {ast.get_repr(node)}")
+
+        # Check if the sub_node is a GeometryDisjoint
+        if isinstance(node.sub_node, ast.GeometryDisjoint):
+            lhs, rhs = node.sub_node.get_sub_nodes()  # Get sub-nodes directly from sub_node
+            new_node = ast.GeometryIntersects(lhs, rhs)  # Create the new node
+            LOGGER.debug(f"Replacing Not(GeometryDisjoint) with GeometryIntersects: {ast.get_repr(new_node)}")
+
+            # Replace the ast.Not node in the parent
+            if parent and parent_attr:
+                setattr(parent, parent_attr, new_node)  # Replace the node in the parent
+            return new_node  # Return the new node to stop further traversal
+    # Handle And/Combination nodes
+    if isinstance(node, ast.Combination):
+        # LOGGER.debug(f"Processing Combination node: {ast.get_repr(node)}")
+
+        # Recursively process lhs and rhs
+        if node.lhs:
+            node.lhs = handleNotGeometryDisjoint(node.lhs, parent=node, parent_attr="lhs")
+        if node.rhs:
+            node.rhs = handleNotGeometryDisjoint(node.rhs, parent=node, parent_attr="rhs")
+
+    # Recursively process sub-nodes
+    if hasattr(node, "get_sub_nodes") and callable(node.get_sub_nodes):
+        for sub_node in node.get_sub_nodes():
+            # Pass the current node as the parent and the attribute name (if applicable)
+            handleNotGeometryDisjoint(sub_node, parent=node, parent_attr="sub_node")
+
+    return node
+
+def handleTypeItem(node: ast.Node, parent: ast.Node = None, parent_attr: str = None):
+    """
+    Traverse the AST and remove ATTRIBUTE type = 'item'.
+
+    :param node: The current AST node being processed.
+    :param parent: The parent node of the current node (used for replacement).
+    :param parent_attr: The attribute name in the parent node that references the current node.
+    :return: The updated AST node.
+    """
+    # LOGGER.debug(f"Processing node of type: {type(node)}")
+
+    # Check if the current node is an ast.Not
+    if isinstance(node, ast.And) or isinstance(node, ast.Or):
+        # LOGGER.debug(f"Original Node: {ast.get_repr(node)}")
+
+        # Check if the sub_node is a GeometryDisjoint
+        if isinstance(node.sub_node, ast.GeometryDisjoint):
+            lhs, rhs = node.sub_node.get_sub_nodes()  # Get sub-nodes directly from sub_node
+            new_node = ast.GeometryIntersects(lhs, rhs)  # Create the new node
+            LOGGER.debug(f"Replacing Not(GeometryDisjoint) with GeometryIntersects: {ast.get_repr(new_node)}")
+
+            # Replace the ast.Not node in the parent
+            if parent and parent_attr:
+                setattr(parent, parent_attr, new_node)  # Replace the node in the parent
+            return new_node  # Return the new node to stop further traversal
+    # Handle And/Combination nodes
+    if isinstance(node, ast.Combination):
+        # LOGGER.debug(f"Processing Combination node: {ast.get_repr(node)}")
+
+        # Recursively process lhs and rhs
+        if node.lhs:
+            node.lhs = handleNotGeometryDisjoint(node.lhs, parent=node, parent_attr="lhs")
+        if node.rhs:
+            node.rhs = handleNotGeometryDisjoint(node.rhs, parent=node, parent_attr="rhs")
+
+    # Recursively process sub-nodes
+    if hasattr(node, "get_sub_nodes") and callable(node.get_sub_nodes):
+        for sub_node in node.get_sub_nodes():
+            # Pass the current node as the parent and the attribute name (if applicable)
+            handleNotGeometryDisjoint(sub_node, parent=node, parent_attr="sub_node")
+
+    return node
+

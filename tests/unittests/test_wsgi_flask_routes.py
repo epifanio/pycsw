@@ -48,6 +48,7 @@ def test_stac_routes_accept_path_containing_collection_and_item_ids():
 from pycsw import wsgi_flask
 
 adapter = wsgi_flask.APP.url_map.bind('localhost')
+# use-case where collection's name has path-like expression
 collection = 'doi:10.1594/PANGAEA.912516'
 item = 'doi:10.1594/PANGAEA.912516/record-1'
 

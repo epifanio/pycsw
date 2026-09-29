@@ -221,6 +221,13 @@ class Repository(object):
             self.query_mappings['bbox'] = self.dataset.wkb_geometry
             self.query_mappings['geometry'] = self.dataset.wkb_geometry
 
+        # custom queryables: columns a deployment adds to the repository and
+        # declares in its custom mappings (MD_CORE_MODEL['queryables']) are
+        # queryable in OGC API - Records under their column name
+        self.custom_queryables = self._custom_queryables()
+        for column in self.custom_queryables.values():
+            self.query_mappings[column] = getattr(self.dataset, column)
+
         if self.dbtype in ['sqlite', 'sqlite3']:  # load SQLite query bindings
             # <= 0.6 behaviour
             if not __version__ >= '0.7':
@@ -238,6 +245,15 @@ class Repository(object):
                         self.context.model['typenames'][tname]['queryables'][qname].items():
                     self.queryables[qname][qkey] = qvalue
 
+        # custom queryables are queryable in CSW under the name the
+        # deployment gives them (e.g. 'ext:length_m'), and advertised as
+        # their own group in GetCapabilities
+        if self.custom_queryables:
+            self.queryables['CustomQueryables'] = {
+                name: {'dbcol': column}
+                for name, column in self.custom_queryables.items()
+            }
+
         # flatten all queryables
         # TODO smarter way of doing this
         self.queryables['_all'] = {}
@@ -246,6 +262,49 @@ class Repository(object):
                 self.queryables['_all'].update(self.queryables[qbl])
 
         self.queryables['_all'].update(self.context.md_core_model['mappings'])
+
+    def _custom_queryables(self):
+        """
+        Custom queryables declared in the repository mappings
+
+        ``MD_CORE_MODEL['queryables']`` maps a queryable name to a column
+        of the repository table, e.g. ``{'ext:length_m': 'length_m'}``.
+        The column must exist (added by the deployment, or through a
+        custom repository / SQL view); names that clash with a core
+        queryable, and columns that do not exist, are skipped with a
+        warning.
+
+        :returns: `dict` of queryable name to column name
+        """
+
+        declared = self.context.md_core_model.get('queryables') or {}
+        if not isinstance(declared, dict):
+            LOGGER.warning('MD_CORE_MODEL queryables is not a dict; ignored')
+            return {}
+
+        reserved = set(self.context.md_core_model['mappings'])
+        for typename in self.context.model['typenames'].values():
+            for group in typename['queryables'].values():
+                reserved.update(group)
+
+        custom = {}
+        for name, column in declared.items():
+            if name in reserved:
+                LOGGER.warning(
+                    f'Custom queryable {name} clashes with a core queryable; ignored')  # noqa
+                continue
+            if not isinstance(column, str) or not hasattr(self.dataset, column):  # noqa
+                LOGGER.warning(
+                    f'Custom queryable {name}: no column {column} in the repository; ignored')  # noqa
+                continue
+            if column in self.query_mappings:
+                LOGGER.warning(
+                    f'Custom queryable {name}: column {column} is already a queryable; ignored')  # noqa
+                continue
+            custom[name] = column
+
+        LOGGER.debug(f'Custom queryables: {custom}')
+        return custom
 
     def ping(self, max_tries=10, wait_seconds=10):
         LOGGER.debug(f"Waiting for {util.sanitize_db_connect(self.database)}...")
@@ -311,7 +370,14 @@ class Repository(object):
         type_mappings = {
             'TEXT': 'string',
             'VARCHAR': 'string',
-            'FLOAT': 'number'
+            'FLOAT': 'number',
+            'REAL': 'number',
+            'DOUBLE PRECISION': 'number',
+            'NUMERIC': 'number',
+            'INTEGER': 'integer',
+            'BIGINT': 'integer',
+            'SMALLINT': 'integer',
+            'BOOLEAN': 'boolean'
         }
 
         properties = {

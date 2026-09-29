@@ -164,6 +164,41 @@ Note you can also reference mappings as a Python object as a dotted path:
 
 See the :ref:`geonode`, :ref:`hhypermap`, and :ref:`odc` for further examples.
 
+.. _custom-queryables:
+
+Custom Queryables
+^^^^^^^^^^^^^^^^^
+
+A repository can carry columns beyond pycsw's core metadata model — a length,
+an area, a status flag — that clients should be able to filter on. Declare
+them in the custom mappings under ``queryables``, mapping a queryable name to
+a column of the repository table:
+
+.. code-block:: python
+
+    # contents of my_custom_pycsw_mappings.py
+    from copy import deepcopy
+    from pycsw.core.config import StaticContext
+
+    MD_CORE_MODEL = deepcopy(StaticContext().md_core_model)
+    MD_CORE_MODEL['queryables'] = {
+        'ext:length_m': 'length_m',
+        'ext:drivable': 'drivable',
+    }
+
+The columns must exist in the table (for example ``ALTER TABLE records ADD
+COLUMN length_m REAL``, or columns of the SQL view a custom mapping points
+to); pycsw does not fill them from metadata documents, so they are populated
+by whatever loads the repository. Each declared queryable is then:
+
+- queryable in CSW under its declared name (``<ogc:PropertyName>ext:length_m</ogc:PropertyName>``),
+  and advertised in ``GetCapabilities`` as the ``CustomQueryables`` constraint of ``GetRecords``
+- queryable in OGC API - Records under its column name (``filter=length_m > 1000``),
+  and listed with its JSON Schema type at ``/collections/{collectionId}/queryables``
+
+A declared name that clashes with a core queryable, or that points to a column
+the table does not have, is skipped with a warning.
+
 .. _existing-repository-requirements:
 
 Existing Repository Requirements

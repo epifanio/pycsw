@@ -40,6 +40,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgeos-dev libpq-dev libxml2-dev libxslt1-dev libz-dev libexpat1
+          # setuptools provides distutils, which Python 3.12 dropped
+          pip install setuptools
           pip install -r requirements.txt -r requirements-standalone.txt \
                       -r requirements-pubsub.txt -r requirements-dev.txt
           pip install -e .

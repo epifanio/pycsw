@@ -1,0 +1,126 @@
+# Keep this fork in step with geopython/pycsw.
+#
+# 1. mirror: fast-forward the fork's master and repo-abstract to upstream.
+#    They carry no fork commits; if one ever diverges the job fails
+#    instead of overwriting it.
+# 2. merge: if metno is missing upstream repo-abstract commits, merge them
+#    into sync/upstream-repo-abstract. A conflict fails the run, with the
+#    conflicting files in the job summary.
+# 3. test + pr: run the metno tests on that branch and open (or update) a
+#    PR to metno with the result. Merging it and tagging the next
+#    3.0.0-metno.N release stays a human decision.
+#
+# Upstream commits that touch .github/workflows can only be pushed with a
+# token that has the `workflow` scope: add one as the SYNC_TOKEN secret
+# (fine-grained: Contents, Pull requests and Workflows read/write on this
+# repo). Without it the built-in token is used, which fails on those
+# commits. PRs opened with the built-in token do not trigger other
+# workflows, which is why the tests run inside this workflow.
+name: upstream sync
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: geopython/pycsw
+  BASE: repo-abstract
+  SYNC_BRANCH: sync/upstream-repo-abstract
+
+jobs:
+  mirror:
+    name: mirror ${{ matrix.branch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [master, repo-abstract]
+    steps:
+      - name: Fast-forward from upstream
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: gh repo sync "$GITHUB_REPOSITORY" --source "$UPSTREAM" --branch "${{ matrix.branch }}"
+
+  merge:
+    needs: mirror
+    runs-on: ubuntu-24.04
+    outputs:
+      behind: ${{ steps.check.outputs.behind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: metno
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Is metno behind upstream?
+        id: check
+        run: |
+          git fetch "https://github.com/$UPSTREAM.git" "$BASE"
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "metno contains upstream $BASE" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo behind=false >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "### Upstream $BASE commits missing from metno"
+              echo '```'
+              git log --oneline HEAD..FETCH_HEAD
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo behind=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Merge upstream into ${{ env.SYNC_BRANCH }}
+        if: steps.check.outputs.behind == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898900+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$SYNC_BRANCH"
+          if ! git merge --no-edit -m "Merge upstream $UPSTREAM $BASE into metno" FETCH_HEAD; then
+            {
+              echo "### Upstream $BASE does not merge cleanly into metno"
+              echo "Resolve by hand. Conflicting files:"
+              echo '```'
+              git diff --name-only --diff-filter=U
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 1
+          fi
+          git push --force origin "$SYNC_BRANCH"
+
+  test:
+    needs: merge
+    if: needs.merge.outputs.behind == 'true'
+    uses: ./.github/workflows/metno-tests.yml
+    with:
+      ref: sync/upstream-repo-abstract
+
+  pr:
+    needs: [merge, test]
+    if: always() && needs.merge.result == 'success' && needs.merge.outputs.behind == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Open or update the sync PR
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          RESULT: ${{ needs.test.result }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          note="Tests on the merge: **$RESULT** ([run]($run_url))."
+          number=$(gh api "repos/$GITHUB_REPOSITORY/pulls?base=metno&head=${GITHUB_REPOSITORY_OWNER}:$SYNC_BRANCH&state=open" --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/$number/comments" -f body="Updated with the latest upstream $BASE. $note"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/pulls" -f base=metno -f head="$SYNC_BRANCH" \
+              -f title="Sync metno with upstream $BASE" \
+              -f body="Merges the latest $UPSTREAM \`$BASE\` into \`metno\`. $note After merging, tag the next \`3.0.0-metno.N\` release."
+          fi
+          [ "$RESULT" = success ]

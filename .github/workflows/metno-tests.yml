@@ -1,0 +1,51 @@
+# Tests for the MET Norway release branch (metno): upstream pycsw's own
+# unit and functional suites, as in upstream's main.yml, which only runs
+# on master and 2.6.  Also called by upstream-sync.yml to test a merge of
+# upstream before it is proposed for metno.
+name: metno tests
+
+on:
+  push:
+    branches:
+      - metno
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    branches:
+      - metno
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: git ref to test
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgeos-dev libpq-dev libxml2-dev libxslt1-dev libz-dev libexpat1
+          pip install -r requirements.txt -r requirements-standalone.txt \
+                      -r requirements-pubsub.txt -r requirements-dev.txt
+          pip install -e .
+      - name: Unit tests
+        run: pytest -m unit
+      # harvesting and distributedsearch query live remote servers, so they
+      # fail whenever those are down, whatever the change under test
+      - name: Functional tests
+        run: pytest -m functional -k 'not harvesting and not distributedsearch'

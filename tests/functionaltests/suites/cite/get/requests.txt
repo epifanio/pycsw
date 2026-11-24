@@ -20,3 +20,6 @@ ba5fc729-3b71-47a0-b7d0-42ec565cd185,SERVICE=CSW&REQUEST=GetCapabilities&ACCEPTV
 c4ea754f-c158-4d8d-8253-dc8f86021b52,request=GetCapabilities
 f4692ec5-9547-4a05-88ab-e6154af2640a,service=CSW&version=2.0.2&request=GetCapabilities
 f997f25e-c865-4d53-a362-0ed1846337f2,service=CSW&version=2.0.2&request=GetRecordById&id=urn:uuid:94bc9c83-97f6-4b40-9eb8-a8e8787a5c63
+getrecords-startposition-past-end,service=CSW&version=2.0.2&request=GetRecords&typenames=csw:Record&resulttype=results&elementsetname=brief&startposition=20
+getrecords-startposition-zero,service=CSW&version=2.0.2&request=GetRecords&typenames=csw:Record&resulttype=results&elementsetname=brief&startposition=0
+getrecords-startposition-not-integer,service=CSW&version=2.0.2&request=GetRecords&typenames=csw:Record&resulttype=results&elementsetname=brief&startposition=abc

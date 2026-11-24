@@ -856,7 +856,14 @@ class API:
         else:
             limit = self.limit
 
-        offset = int(args.get('offset', 0))
+        try:
+            offset = int(args.get('offset', 0))
+            if offset < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            msg = 'Offset must be 0 or a positive integer'
+            LOGGER.exception(msg)
+            return self.get_exception(400, headers_, 'InvalidParameterValue', msg)
 
         if query_parser is not None and cql_query != {}:
             LOGGER.debug('Parsing CQL into AST')
@@ -890,9 +897,15 @@ class API:
 #            LOGGER.debug('Adding additional stable sort on identifier')
 #            query = query.order_by(self.repository.query_mappings['identifier'].asc())
 
-        count, records = self.repository.query(
-            constraint={'ast': ast}, sortby=sortbys, maxrecords=limit,
-            startposition=offset)
+        try:
+            count, records = self.repository.query(
+                constraint={'ast': ast}, sortby=sortbys, maxrecords=limit,
+                startposition=offset)
+        except TimeoutError as err:
+            # the repository gave up on a slow query (e.g. a very deep page)
+            msg = str(err) or 'The query took too long'
+            LOGGER.exception(msg)
+            return self.get_exception(504, headers_, 'NoApplicableCode', msg)
 
         if facets_requested:
             LOGGER.debug('Running facet query')

@@ -80,3 +80,5 @@ e67ca935-d65d-4d8c-8302-1405333dded0,config=tests/suites/csw30/default.yml
 e7704509-3441-458f-8ef0-e333c6b6043f,elementName=ns1:subject&elementSetName=brief&request=GetRecords&service=CSW&typeNames=Record&namespace=xmlns(ns1%3Dhttp://purl.org/dc/elements/1.1/)&version=3.0.0
 f1223a49-6d08-44ff-97fe-4c32cbbfad82,elementSetName=summary&maxRecords=0&q=titles&request=GetRecords&service=CSW&typeNames=Record&version=3.0.0
 f89dd4e1-3a81-4433-afd2-a3fa1bdb1e18,elementSetName=full&outputFormat=text/example&request=GetRecords&service=CSW&typeNames=Record&version=3.0.0
+getrecords-startposition-past-end,service=CSW&version=3.0.0&request=GetRecords&typenames=csw:Record&resulttype=results&elementsetname=brief&startposition=20
+getrecords-startposition-zero,service=CSW&version=3.0.0&request=GetRecords&typenames=csw:Record&resulttype=results&elementsetname=brief&startposition=0

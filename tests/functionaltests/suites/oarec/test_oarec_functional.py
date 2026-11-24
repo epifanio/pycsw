@@ -331,6 +331,37 @@ def test_items(config):
     assert status == 400
 
 
+@pytest.mark.parametrize('offset', ['-1', 'abc'])
+def test_items_invalid_offset(config, offset):
+    api = API(config)
+    headers, status, content = api.items({}, None, {'offset': offset})
+    assert status == 400
+    content = json.loads(content)
+    assert content['code'] == 'InvalidParameterValue'
+    assert content['description'] == 'Offset must be 0 or a positive integer'
+
+
+def test_items_offset_zero(config):
+    api = API(config)
+    headers, status, content = api.items({}, None, {'offset': '0'})
+    assert status == 200
+    assert json.loads(content)['numberReturned'] == 10
+
+
+def test_items_repository_timeout(config):
+    api = API(config)
+
+    def slow_query(*args, **kwargs):
+        raise TimeoutError('The query took longer than 25 s')
+
+    api.repository.query = slow_query
+    headers, status, content = api.items({}, None, {'offset': '5000000'})
+    assert status == 504
+    content = json.loads(content)
+    assert content['code'] == 'NoApplicableCode'
+    assert content['description'] == 'The query took longer than 25 s'
+
+
 def test_item(config):
     api = API(config)
     item = 'urn:uuid:19887a8a-f6b0-4a63-ae56-7fba0e17801f'

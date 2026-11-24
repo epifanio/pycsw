@@ -852,6 +852,14 @@ class Csw3:
         if 'startposition' not in self.parent.kvp or not self.parent.kvp['startposition']:
             self.parent.kvp['startposition'] = 1
 
+        # record positions start at 1
+        try:
+            if int(self.parent.kvp['startposition']) < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return self.exceptionreport('InvalidParameterValue', 'startposition',
+            'Invalid startPosition value: must be an integer of 1 or more')
+
         if 'recordids' in self.parent.kvp and self.parent.kvp['recordids'] != '':
             # query repository
             LOGGER.info('Querying repository with RECORD ids: %s', self.parent.kvp['recordids'])
@@ -873,6 +881,11 @@ class Csw3:
                 sortby=self.parent.kvp['sortby'], typenames=self.parent.kvp['typenames'],
                 maxrecords=self.parent.kvp['maxrecords'],
                 startposition=int(self.parent.kvp['startposition'])-1)
+            except TimeoutError as err:
+                # the repository gave up on a slow query (e.g. a very deep page)
+                LOGGER.exception('Query timed out.  Query: %s', self.parent.kvp['constraint'])
+                return self.exceptionreport('NoApplicableCode', 'constraint',
+                str(err) or 'The query took too long')
             except Exception as err:
                 LOGGER.exception('Invalid query syntax.  Query: %s', self.parent.kvp['constraint'])
                 LOGGER.exception('Invalid query syntax.  Result: %s', err)
